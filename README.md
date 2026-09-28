@@ -1,8 +1,12 @@
-# xiaobai助手 · Mac 版
+# xiaobai助手 · Mac 版 —— 英雄联盟 LOL 极地大乱斗助手工具
 
-Windows 版（[lixyd/xiaobai-helper](https://github.com/lixyd/xiaobai-helper)）的 macOS 原生移植 —— **Swift + SwiftUI，无 Python 依赖，双击即用**。
+**英雄联盟（League of Legends / LOL）** macOS 原生助手插件：极地大乱斗 / 海克斯大乱斗 **自动接受对局、自动开始匹配、自动重连、一键启动游戏、窗口吸附客户端**。
 
-专注 **极地大乱斗 / 海克斯大乱斗**。纯官方 LCU 本地 API —— **无进程注入 / 无内存读写 / 无键鼠模拟**。
+Windows 版（[lixyd/xiaobai-helper](https://github.com/lixyd/xiaobai-helper)）的 macOS 移植 —— **Swift + SwiftUI，无 Python 依赖，双击即用**。
+
+纯官方 LCU 本地 API —— **无进程注入 / 无内存读写 / 无键鼠模拟**，**不需要辅助功能等任何系统权限**。
+
+> 关键词：英雄联盟助手 · LOL 助手 · LOL 工具 · 大乱斗插件 · 自动接受对局 · 自动匹配工具 · ARAM 助手 · Mac 游戏工具 · LCU API · Riot Games
 
 ![主界面](docs/ui-mac.png)
 
