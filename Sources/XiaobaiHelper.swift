@@ -1,4 +1,4 @@
-// xiaobai助手 · Mac 极简版 v0.2.0
+// xiaobai助手 · Mac 极简版 v0.4.0
 // 匹配自动化：自动接受对局 / 自动开始匹配 / 自动重连 / 自动回到房间
 // 纯官方 LCU 本地 API —— 无注入 / 无内存读写 / 无键鼠模拟
 
@@ -123,6 +123,8 @@ func phaseDisplay(_ raw: String) -> String {
 
 struct SearchState: Decodable { let searchState: String }
 struct ReadyCheckState: Decodable { let state: String?; let playerResponse: String? }
+struct LobbyMembers: Decodable { let localMember: LobbyMember }
+struct LobbyMember: Decodable { let isLeader: Bool?; let ready: Bool? }
 
 @MainActor
 final class Engine: ObservableObject {
@@ -145,8 +147,20 @@ final class Engine: ObservableObject {
     private var client: LCUClient?
     private var prevPhase = ""
     private var lastSearch: Date = .distantPast
+    private var searchThrottle: Double = 5        // 失败后自动拉长，避免骚扰
+    private var sawSearching = false              // 本轮房间里见过"排队中"（用于识别用户主动取消）
+    private var cancelLogged = false
+    private var lastReconnect: Date = .distantPast
+    private var lastPlayAgain: Date = .distantPast
+    private var warned: Set<String> = []
     private var everLoggedWaiting = false
     private var handledReadyCheck = false
+
+    private func logOnce(_ key: String, _ msg: String) {
+        guard !warned.contains(key) else { return }
+        warned.insert(key)
+        log(msg)
+    }
 
     // 设置持久化（~/Library/Application Support/xiaobai助手/settings.json）
     private let settingsURL: URL = {
@@ -237,6 +251,10 @@ final class Engine: ObservableObject {
         client = nil; connected = false
         phaseRaw = ""; prevPhase = ""
         everLoggedWaiting = false; handledReadyCheck = false
+        sawSearching = false; cancelLogged = false
+        warned.removeAll()
+        searchThrottle = 5
+        lastReconnect = .distantPast; lastPlayAgain = .distantPast
         log("■ 自动化已停止")
     }
 
@@ -264,14 +282,50 @@ final class Engine: ObservableObject {
                 do {
                     let p = try await c.phase()
                     phaseRaw = p
-                    if p != prevPhase {
+                    let phaseChanged = (p != prevPhase)
+                    if phaseChanged {
                         log("阶段 → \(phaseDisplay(p))")
                         if p != "ReadyCheck" { handledReadyCheck = false }
+                        // 进入新的结算阶段（WaitingForStats → PreEndOfGame → EndOfGame）时，
+                        // 立即尝试一次回到房间（对齐 LeagueAkari 的分阶段处理）
+                        if isEndOfGamePhase(p) { lastPlayAgain = .distantPast }
                         prevPhase = p
+                    }
+                    if p != "Lobby" {
+                        // 离开房间后重置「用户取消排队」记忆
+                        if sawSearching || cancelLogged {
+                            sawSearching = false; cancelLogged = false
+                            warned.remove("not-leader"); warned.remove("not-ready")
+                        }
+                        searchThrottle = 5
                     }
                     if p == "ReadyCheck" && autoAccept && !handledReadyCheck {
                         handledReadyCheck = true
                         acceptTask = Task { [weak self] in await self?.doAccept(client: c) }
+                    }
+                    // 自动重连（对齐 Windows 版：Reconnect 阶段 + 8s 冷却 + 检查返回值）
+                    if p == "Reconnect" && autoReconnect {
+                        if Date().timeIntervalSince(lastReconnect) >= 8 {
+                            lastReconnect = Date()
+                            if let (_, h) = try? await c.post("/lol-gameflow/v1/reconnect"),
+                               (200..<300).contains(h.statusCode) {
+                                log("✅ 已自动重连对局")
+                            } else {
+                                logOnce("reconnect-fail", "⚠ 自动重连请求未成功（客户端可能未就绪），稍后重试")
+                            }
+                        }
+                    }
+                    // 自动回到房间（对齐 Windows 版：结算三阶段 + 20s 冷却 + 检查返回值）
+                    if autoPlayAgain && isEndOfGamePhase(p) {
+                        if Date().timeIntervalSince(lastPlayAgain) >= 20 {
+                            lastPlayAgain = Date()
+                            if let (_, h) = try? await c.post("/lol-lobby/v2/play-again"),
+                               (200..<300).contains(h.statusCode) {
+                                log("✅ 已自动回到房间")
+                            } else {
+                                logOnce("playagain-fail", "⚠ 暂时无法回到房间（可能还在结算），稍后重试")
+                            }
+                        }
                     }
                     if p == "Lobby" && autoStart { await tryAutoStart(client: c) }
                 } catch {
@@ -281,6 +335,10 @@ final class Engine: ObservableObject {
             }
             try? await Task.sleep(nanoseconds: 500_000_000)
         }
+    }
+
+    private func isEndOfGamePhase(_ p: String) -> Bool {
+        p == "PreEndOfGame" || p == "WaitingForStats" || p == "EndOfGame"
     }
 
     private func doAccept(client c: LCUClient) async {
@@ -313,14 +371,56 @@ final class Engine: ObservableObject {
     }
 
     private func tryAutoStart(client c: LCUClient) async {
-        guard Date().timeIntervalSince(lastSearch) >= 5 else { return }
+        guard Date().timeIntervalSince(lastSearch) >= searchThrottle else { return }
         lastSearch = Date()
+
+        // 1. 队列状态
         guard let (d, h) = try? await c.get("/lol-lobby/v2/lobby/matchmaking/search-state"),
               h.statusCode == 200,
-              let st = try? JSONDecoder().decode(SearchState.self, from: d),
-              st.searchState == "Invalid" else { return }
-        _ = try? await c.post("/lol-lobby/v2/lobby/matchmaking/search")
-        log("已自动开始匹配")
+              let st = try? JSONDecoder().decode(SearchState.self, from: d) else { return }
+
+        if st.searchState != "Invalid" {
+            sawSearching = true          // 正在排队 / 有进度，标记本轮已搜过
+            return
+        }
+
+        // 2. 本轮已搜过又回到未排队 → 是用户主动取消（或搜完未点），
+        //    尊重用户意图，不再强行重排（离开房间后自动复位）
+        if sawSearching {
+            if !cancelLogged {
+                cancelLogged = true
+                log("⏸ 检测到排队已取消，本轮不再自动开始匹配")
+            }
+            return
+        }
+
+        // 3. 查询本地成员状态：是否队长 / 是否已准备
+        //    拿不到状态就不动，绝不盲发（联盟战棋/排位必须先点「准备」）
+        var isLeader = true
+        var isReady = true
+        guard let (d2, h2) = try? await c.get("/lol-lobby/v2/lobby/members"),
+              h2.statusCode == 200,
+              let m = try? JSONDecoder().decode(LobbyMembers.self, from: d2) else { return }
+        isLeader = m.localMember.isLeader ?? true
+        isReady = m.localMember.ready ?? true
+
+        if !isLeader {
+            logOnce("not-leader", "⏸ 你不是队长，无法开始匹配（已跳过）")
+            return
+        }
+        if !isReady {
+            logOnce("not-ready", "⏸ 尚未点「准备」，等你准备后自动开始匹配")
+            return
+        }
+
+        // 4. 真正开始匹配 —— 检查返回值，如实上报
+        if let (_, h3) = try? await c.post("/lol-lobby/v2/lobby/matchmaking/search"),
+           (200..<300).contains(h3.statusCode) {
+            log("✅ 已自动开始匹配")
+        } else {
+            searchThrottle = 30          // 失败拉长间隔，避免高频骚扰触发风控
+            logOnce("search-fail", "⚠ 开始匹配未成功，30 秒后重试")
+        }
     }
 
     // 一键启动游戏客户端：自定义路径优先，否则自动识别
@@ -445,12 +545,14 @@ struct ContentView: View {
             Text("自动化选项").font(.system(size: 10, weight: .semibold)).foregroundColor(sub)
             Toggle("自动接受对局", isOn: $engine.autoAccept).foregroundColor(ink)
             HStack {
-                Toggle("自动开始匹配", isOn: $engine.autoStart)
+                Text("接受延迟").font(.system(size: 10)).foregroundColor(sub)
                 Picker("", selection: $engine.acceptDelay) {
                     Text("1s").tag(Double(1)); Text("3s").tag(Double(3)); Text("5s").tag(Double(5))
                 }
-                .pickerStyle(.segmented).frame(width: 100).disabled(!engine.autoAccept)
+                .pickerStyle(.segmented).frame(width: 120).disabled(!engine.autoAccept)
+                Spacer()
             }
+            Toggle("自动开始匹配", isOn: $engine.autoStart).foregroundColor(ink)
             Toggle("自动重连", isOn: $engine.autoReconnect).foregroundColor(ink)
             Toggle("自动回到房间", isOn: $engine.autoPlayAgain).foregroundColor(ink)
             Toggle("吸附客户端右侧", isOn: Binding(
