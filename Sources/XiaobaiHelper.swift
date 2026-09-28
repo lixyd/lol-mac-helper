@@ -4,7 +4,26 @@
 
 import SwiftUI
 import AppKit
+import CoreGraphics
 import Foundation
+
+// MARK: - 查找游戏客户端窗口位置（不需要任何权限）
+
+func clientWindowRect() -> CGRect? {
+    let opts = CGWindowListOption([.optionOnScreenOnly, .excludeDesktopElements])
+    guard let list = CGWindowListCopyWindowInfo(opts, CGWindowID(0)) as? [[String: Any]] else { return nil }
+    var best: CGRect? = nil
+    for w in list {
+        guard (w[kCGWindowLayer as String] as? Int ?? -1) == 0 else { continue }
+        let owner = w[kCGWindowOwnerName as String] as? String ?? ""
+        guard owner.contains("League of Legends") || owner.contains("LeagueClientUx") else { continue }
+        guard let raw = w[kCGWindowBounds as String],
+              let r = CGRect(dictionaryRepresentation: raw as! CFDictionary) else { continue }
+        guard r.width > 300, r.height > 200 else { continue }
+        if best == nil || r.width * r.height > best!.width * best!.height { best = r }
+    }
+    return best
+}
 
 // MARK: - Lockfile
 
@@ -118,16 +137,18 @@ final class Engine: ObservableObject {
     @Published var acceptDelay: Double = 1
     @Published var showDonate = false
     @Published var gamePath = ""   // 空 = 自动识别
+    @Published var attachToClient = true   // 吸附到客户端窗口右侧
 
     private var pollTask: Task<Void, Never>?
     private var acceptTask: Task<Void, Never>?
+    private var attachTask: Task<Void, Never>?
     private var client: LCUClient?
     private var prevPhase = ""
     private var lastSearch: Date = .distantPast
     private var everLoggedWaiting = false
     private var handledReadyCheck = false
 
-    // 游戏路径设置持久化（~/Library/Application Support/xiaobai助手/settings.json）
+    // 设置持久化（~/Library/Application Support/xiaobai助手/settings.json）
     private let settingsURL: URL = {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("xiaobai助手", isDirectory: true)
@@ -135,22 +156,70 @@ final class Engine: ObservableObject {
         return dir.appendingPathComponent("settings.json")
     }()
 
-    init() { loadGamePath() }
+    init() {
+        loadSettings()
+        attachTask = Task { await attachLoop() }   // 常驻：跟随客户端窗口
+    }
 
-    private func loadGamePath() {
+    private func loadSettings() {
         if let d = try? Data(contentsOf: settingsURL),
            let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
             gamePath = obj["game_path"] as? String ?? ""
+            if let a = obj["attach_to_client"] as? Bool { attachToClient = a }
+        }
+    }
+
+    private func saveSettings() {
+        let obj: [String: Any] = ["game_path": gamePath, "attach_to_client": attachToClient]
+        if let d = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted]) {
+            try? d.write(to: settingsURL)
         }
     }
 
     func setGamePath(_ path: String) {
         gamePath = path
-        if let d = try? JSONSerialization.data(withJSONObject: ["game_path": path],
-                                               options: [.prettyPrinted]) {
-            try? d.write(to: settingsURL)
-        }
+        saveSettings()
         log(path.isEmpty ? "游戏路径恢复自动识别" : "游戏路径已保存：\(path)")
+    }
+
+    func setAttach(_ on: Bool) {
+        attachToClient = on
+        saveSettings()
+        log(on ? "已开启：吸附客户端窗口右侧" : "已关闭吸附")
+    }
+
+    // 跟随客户端窗口：贴右侧，右边放不下则贴左侧，顶部对齐
+    private func attachLoop() async {
+        while !Task.isCancelled {
+            if attachToClient,
+               let r = clientWindowRect(),
+               let win = NSApp.mainWindow ?? NSApp.windows.first(where: { $0.isVisible && $0.level == .normal }) {
+                let our = win.frame
+                let screen = NSScreen.screens.first { s in
+                    let mid = CGPoint(x: r.midX, y: r.midY)
+                    let q = CGRect(x: s.frame.minX, y: s.frame.maxY - (mid.y), width: s.frame.width, height: 1)
+                    return q.origin.x <= mid.x && mid.x <= s.frame.maxX && q.origin.y <= s.frame.minY + 1
+                } ?? NSScreen.main
+                let vis = screen?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
+                let screenH = screen?.frame.height ?? 900
+
+                var x = r.maxX + 8                                  // 优先右侧
+                if x + our.width > vis.maxX {                        // 右侧放不下 → 左侧
+                    x = r.minX - our.width - 8
+                }
+                x = min(max(x, vis.minX), max(vis.minX, vis.maxX - our.width))
+
+                let topQuartz = r.minY                               // 顶部对齐客户端
+                var y = screenH - topQuartz - our.height             // Quartz → Cocoa
+                y = min(max(y, vis.minY), max(vis.minY, vis.maxY - our.height))
+
+                let target = NSPoint(x: x, y: y)
+                if abs(our.origin.x - target.x) > 1 || abs(our.origin.y - target.y) > 1 {
+                    win.setFrameOrigin(target)
+                }
+            }
+            try? await Task.sleep(nanoseconds: 700_000_000)
+        }
     }
 
     func toggle() { running ? stop() : start() }
@@ -384,6 +453,10 @@ struct ContentView: View {
             }
             Toggle("自动重连", isOn: $engine.autoReconnect).foregroundColor(ink)
             Toggle("自动回到房间", isOn: $engine.autoPlayAgain).foregroundColor(ink)
+            Toggle("吸附客户端右侧", isOn: Binding(
+                get: { engine.attachToClient },
+                set: { engine.setAttach($0) }
+            )).foregroundColor(ink)
             HStack(spacing: 6) {
                 Text(engine.gamePath.isEmpty ? "游戏路径：自动识别" : "游戏路径：自定义")
                     .font(.system(size: 10))
