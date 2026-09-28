@@ -1,4 +1,4 @@
-// xiaobai助手 · Mac 极简版 v0.4.0
+// xiaobai助手 · Mac 极简版 v0.5.0
 // 匹配自动化：自动接受对局 / 自动开始匹配 / 自动重连 / 自动回到房间
 // 纯官方 LCU 本地 API —— 无注入 / 无内存读写 / 无键鼠模拟
 
@@ -90,6 +90,7 @@ final class LCUClient {
 
     func get(_ p: String) async throws -> (Data, HTTPURLResponse) { try await req("GET", p) }
     func post(_ p: String) async throws -> (Data, HTTPURLResponse) { try await req("POST", p) }
+    func put(_ p: String) async throws -> (Data, HTTPURLResponse) { try await req("PUT", p) }
 
     func phase() async throws -> String {
         let (d, h) = try await get("/lol-gameflow/v1/gameflow-phase")
@@ -123,8 +124,11 @@ func phaseDisplay(_ raw: String) -> String {
 
 struct SearchState: Decodable { let searchState: String }
 struct ReadyCheckState: Decodable { let state: String?; let playerResponse: String? }
-struct LobbyMembers: Decodable { let localMember: LobbyMember }
 struct LobbyMember: Decodable { let isLeader: Bool?; let ready: Bool? }
+struct LobbyInfo: Decodable {
+    let canStartActivity: Bool?
+    let localMember: LobbyMember?
+}
 
 @MainActor
 final class Engine: ObservableObject {
@@ -394,22 +398,36 @@ final class Engine: ObservableObject {
             return
         }
 
-        // 3. 查询本地成员状态：是否队长 / 是否已准备
-        //    拿不到状态就不动，绝不盲发（联盟战棋/排位必须先点「准备」）
-        var isLeader = true
-        var isReady = true
-        guard let (d2, h2) = try? await c.get("/lol-lobby/v2/lobby/members"),
+        // 3. 读取房间状态：canStartActivity = 客户端判定的「现在能不能开」
+        //    （含队长权限、是否已准备、人数限制等，与 LeagueAkari 同源）
+        guard let (d2, h2) = try? await c.get("/lol-lobby/v2/lobby"),
               h2.statusCode == 200,
-              let m = try? JSONDecoder().decode(LobbyMembers.self, from: d2) else { return }
-        isLeader = m.localMember.isLeader ?? true
-        isReady = m.localMember.ready ?? true
+              let lobby = try? JSONDecoder().decode(LobbyInfo.self, from: d2) else {
+            logOnce("lobby-fail", "⚠ 无法读取房间状态，暂不自动开始匹配")
+            return
+        }
 
-        if !isLeader {
+        if lobby.localMember?.isLeader == false {
             logOnce("not-leader", "⏸ 你不是队长，无法开始匹配（已跳过）")
             return
         }
-        if !isReady {
-            logOnce("not-ready", "⏸ 尚未点「准备」，等你准备后自动开始匹配")
+
+        // 4. 还不能开 → 多半是没点「准备」（联盟战棋/排位）。
+        //    自动帮你点准备：PUT /lol-lobby/v1/parties/ready（即客户端 ✓ 按钮的请求）
+        if lobby.canStartActivity != true {
+            if lobby.localMember?.ready == false {
+                if let (_, rh) = try? await c.put("/lol-lobby/v1/parties/ready"),
+                   (200..<300).contains(rh.statusCode) {
+                    log("✅ 已自动点「准备」")
+                    return                       // 下一轮确认可开后再搜索
+                } else {
+                    searchThrottle = 10
+                    logOnce("ready-fail", "⚠ 自动点「准备」未成功，稍后重试")
+                    return
+                }
+            }
+            searchThrottle = 10
+            logOnce("cannot-start", "⏸ 客户端提示当前不可开始匹配（等待条件满足）")
             return
         }
 
