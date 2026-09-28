@@ -34,6 +34,9 @@ cd xiaobai-helper-mac
 ./build.sh          # 产出 build/xiaobai助手.app（arm64，ad-hoc 签名）
 ```
 
+构建脚本会同时把一份副本同步到 `~/Desktop/xiaobai助手.app`，双击即可运行；
+启动后窗口自动居中并置前。
+
 要求：macOS 13+，Xcode Command Line Tools（`xcode-select --install`）。
 
 ## 权限说明

@@ -1,13 +1,12 @@
-// xiaobai助手 · Mac 版 v0.4.0
+// xiaobai助手 · Mac 极简版 v0.2.0
 // 匹配自动化：自动接受对局 / 自动开始匹配 / 自动重连 / 自动回到房间
 // 纯官方 LCU 本地 API —— 无注入 / 无内存读写 / 无键鼠模拟
-// v0.4.0：关闭 App Nap（后台不被节流）+ 独立 ready-check 盯守 + 搜索防限流（冷却重试）
 
 import SwiftUI
 import AppKit
 import Foundation
 
-// MARK: - Lockfile 发现
+// MARK: - Lockfile
 
 struct LockfileInfo { let port: Int; let password: String }
 
@@ -61,20 +60,17 @@ final class LCUClient {
         session = URLSession(configuration: cfg, delegate: InsecureTrustDelegate(), delegateQueue: nil)
     }
 
-    private func send(_ m: String, _ p: String, body: String? = nil) async throws -> (Data, HTTPURLResponse) {
+    private func req(_ m: String, _ p: String) async throws -> (Data, HTTPURLResponse) {
         var r = URLRequest(url: URL(string: base + p)!)
         r.httpMethod = m
         r.setValue(auth, forHTTPHeaderField: "Authorization")
-        if body != nil { r.setValue("application/json", forHTTPHeaderField: "Content-Type") }
-        if let b = body { r.httpBody = Data(b.utf8) }
         let (d, resp) = try await session.data(for: r)
         guard let h = resp as? HTTPURLResponse else { throw LCUError.badResponse }
         return (d, h)
     }
 
-    func get(_ p: String) async throws -> (Data, HTTPURLResponse) { try await send("GET", p) }
-    func post(_ p: String) async throws -> (Data, HTTPURLResponse) { try await send("POST", p) }
-    func put(_ p: String, body: String = "") async throws -> (Data, HTTPURLResponse) { try await send("PUT", p, body: body) }
+    func get(_ p: String) async throws -> (Data, HTTPURLResponse) { try await req("GET", p) }
+    func post(_ p: String) async throws -> (Data, HTTPURLResponse) { try await req("POST", p) }
 
     func phase() async throws -> String {
         let (d, h) = try await get("/lol-gameflow/v1/gameflow-phase")
@@ -124,18 +120,12 @@ final class Engine: ObservableObject {
     @Published var gamePath = ""   // 空 = 自动识别
 
     private var pollTask: Task<Void, Never>?
-    private var watchTask: Task<Void, Never>?
+    private var acceptTask: Task<Void, Never>?
     private var client: LCUClient?
     private var prevPhase = ""
+    private var lastSearch: Date = .distantPast
     private var everLoggedWaiting = false
-    private var lastStartOkLog: Date = .distantPast
-    private var activityToken: NSObjectProtocol?   // 阻止 App Nap 节流
-
-    // 搜索状态机：每次进房间只尝试一次，失败熔断，绝不高频重试
-    private var searchAttempted = false
-    private var searchCooldownUntil: Date = .distantPast
-    private var searchFailCount = 0
-    private var searchDisabled = false   // 熔断：连续失败后本会话不再自动排队
+    private var handledReadyCheck = false
 
     // 游戏路径设置持久化（~/Library/Application Support/xiaobai助手/settings.json）
     private let settingsURL: URL = {
@@ -167,31 +157,17 @@ final class Engine: ObservableObject {
 
     func start() {
         running = true
-        // 关键：关闭 App Nap，否则切到后台后轮询被系统拖慢，错过接受窗口
-        if activityToken == nil {
-            activityToken = ProcessInfo.processInfo.beginActivity(
-                options: [.userInitiated, .latencyCritical, .idleSystemSleepDisabled],
-                reason: "LCU 自动化轮询")
-        }
-        log("▶ 自动化已启动（后台保护已开启）")
+        log("▶ 自动化已启动")
         pollTask = Task { await run() }
-        watchTask = Task { await acceptWatch() }
     }
 
     func stop() {
         running = false
-        pollTask?.cancel(); watchTask?.cancel()
-        pollTask = nil; watchTask = nil
-        if let t = activityToken {
-            ProcessInfo.processInfo.endActivity(t)
-            activityToken = nil
-        }
+        pollTask?.cancel(); acceptTask?.cancel()
+        pollTask = nil; acceptTask = nil
         client = nil; connected = false
         phaseRaw = ""; prevPhase = ""
-        everLoggedWaiting = false
-        searchAttempted = false
-        searchFailCount = 0
-        searchDisabled = false
+        everLoggedWaiting = false; handledReadyCheck = false
         log("■ 自动化已停止")
     }
 
@@ -207,7 +183,7 @@ final class Engine: ObservableObject {
                 if let lf = discoverLockfile() {
                     client = LCUClient(port: lf.port, password: lf.password)
                     connected = true; everLoggedWaiting = false
-                    prevPhase = ""
+                    prevPhase = ""; handledReadyCheck = false
                     log("已连接客户端（端口 \(lf.port)）")
                 } else if !everLoggedWaiting {
                     connected = false
@@ -221,111 +197,61 @@ final class Engine: ObservableObject {
                     phaseRaw = p
                     if p != prevPhase {
                         log("阶段 → \(phaseDisplay(p))")
+                        if p != "ReadyCheck" { handledReadyCheck = false }
                         prevPhase = p
                     }
+                    if p == "ReadyCheck" && autoAccept && !handledReadyCheck {
+                        handledReadyCheck = true
+                        acceptTask = Task { [weak self] in await self?.doAccept(client: c) }
+                    }
                     if p == "Lobby" && autoStart { await tryAutoStart(client: c) }
-                    if p == "Reconnect" && autoReconnect {
-                        _ = try? await c.post("/lol-gameflow/v1/game/reconnect")
-                        log("已自动重连对局")
-                    }
-                    if p == "WaitingForStats" && autoPlayAgain {
-                        _ = try? await c.post("/lol-lobby/v2/play-again")
-                        log("已自动回到房间")
-                    }
                 } catch {
                     if connected { connected = false; log("连接出错，重新发现客户端…") }
                     client = nil; prevPhase = ""; phaseRaw = ""
                 }
             }
-            try? await Task.sleep(nanoseconds: 400_000_000)
+            try? await Task.sleep(nanoseconds: 500_000_000)
         }
     }
 
-    // 独立盯守 ready-check：不依赖 gameflow 阶段跳变
-    private enum RCRound { case idle, armed, done }
-
-    private func acceptWatch() async {
-        var st: RCRound = .idle
-        while !Task.isCancelled {
-            guard let c = client else {
-                st = .idle
-                try? await Task.sleep(nanoseconds: 300_000_000)
-                continue
-            }
-            var resp: String? = nil
+    private func doAccept(client c: LCUClient) async {
+        if acceptDelay > 0 { try? await Task.sleep(nanoseconds: UInt64(acceptDelay * 1_000_000_000)) }
+        var logged = false
+        var failLogged = false
+        for _ in 0..<30 {
+            guard !Task.isCancelled, phaseRaw == "ReadyCheck" else { return }
+            var needAccept = true
             if let (d, h) = try? await c.get("/lol-matchmaking/v1/ready-check"),
-               h.statusCode == 200 {
-                resp = (try? JSONDecoder().decode(ReadyCheckState.self, from: d))?
-                    .playerResponse ?? "None"
-            }
-
-            if resp == nil {
-                st = .idle                       // 不在 ready check，重置
-            } else if resp!.lowercased() == "none" {
-                if st == .idle {
-                    st = .armed
-                    if acceptDelay > 0 {
-                        try? await Task.sleep(nanoseconds: UInt64(acceptDelay * 1_000_000_000))
-                    }
+               h.statusCode == 200,
+               let rc = try? JSONDecoder().decode(ReadyCheckState.self, from: d) {
+                if let pr = rc.playerResponse, pr.lowercased() != "none" {
+                    if !logged { log("已手动接受，跳过") }
+                    return
                 }
-                if st == .armed && autoAccept {
-                    if let (_, h2) = try? await c.post("/lol-matchmaking/v1/ready-check/accept"),
-                       (200..<300).contains(h2.statusCode) {
-                        log("已自动接受对局（延迟 \(Int(acceptDelay))s）")
-                        st = .done
-                    }
-                    // 失败则保持 armed，下个周期继续重试
-                }
-            } else {
-                if st == .armed { log("已手动接受，跳过") }
-                st = .done
             }
-            try? await Task.sleep(nanoseconds: 250_000_000)
+            if needAccept {
+                if let (_, h2) = try? await c.post("/lol-matchmaking/v1/ready-check/accept"),
+                   (200..<300).contains(h2.statusCode) {
+                    if !logged { log("已自动接受对局（延迟 \(Int(acceptDelay))s）"); logged = true }
+                    failLogged = false
+                } else if !failLogged {
+                    log("接受请求失败，重试中…")
+                    failLogged = true
+                }
+            }
+            try? await Task.sleep(nanoseconds: 500_000_000)
         }
     }
 
     private func tryAutoStart(client c: LCUClient) async {
-        guard !searchDisabled, Date() >= searchCooldownUntil else { return }
+        guard Date().timeIntervalSince(lastSearch) >= 5 else { return }
+        lastSearch = Date()
         guard let (d, h) = try? await c.get("/lol-lobby/v2/lobby/matchmaking/search-state"),
               h.statusCode == 200,
-              let st = try? JSONDecoder().decode(SearchState.self, from: d) else { return }
-
-        switch st.searchState {
-        case "Searching", "Requested", "Found":
-            searchAttempted = true               // 排队中
-        case "Invalid":
-            if searchAttempted {                 // 排队结束（被拒/取消/结算回来）
-                searchAttempted = false
-                searchCooldownUntil = Date().addingTimeInterval(30)
-                return
-            }
-            // 只发一次请求，不做任何额外的状态改写
-            var ok = false
-            var code = 0
-            if let (_, h2) = try? await c.post("/lol-lobby/v2/lobby/matchmaking/search") {
-                code = h2.statusCode
-                ok = (200..<300).contains(code)
-            }
-            if ok {
-                searchFailCount = 0
-                if Date().timeIntervalSince(lastStartOkLog) > 15 {
-                    log("已自动开始匹配")
-                    lastStartOkLog = Date()
-                }
-            } else {
-                searchFailCount += 1
-                if code == 403 || searchFailCount >= 2 {
-                    // 熔断：不再自动排队，避免影响客户端本身
-                    searchDisabled = true
-                    log("自动排队已停用（客户端拒绝 HTTP \(code)），仅保留自动接受")
-                } else {
-                    searchCooldownUntil = Date().addingTimeInterval(60)
-                    log("开始匹配失败（HTTP \(code)），60 秒后重试一次")
-                }
-            }
-        default:
-            break
-        }
+              let st = try? JSONDecoder().decode(SearchState.self, from: d),
+              st.searchState == "Invalid" else { return }
+        _ = try? await c.post("/lol-lobby/v2/lobby/matchmaking/search")
+        log("已自动开始匹配")
     }
 
     // 一键启动游戏客户端：自定义路径优先，否则自动识别
@@ -352,7 +278,7 @@ final class Engine: ObservableObject {
     }
 }
 
-// MARK: - 界面（窗口锁定 300×430，锁定浅色外观）
+// MARK: - 界面（窗口锁定 300×430，按钮通栏）
 
 private let bg = Color(red: 0.961, green: 0.961, blue: 0.969)
 private let cardColor = Color.white
@@ -375,6 +301,14 @@ struct ContentView: View {
         .frame(width: 300, height: 430)
         .background(bg)
         .preferredColorScheme(.light)
+        .onAppear {
+            // 启动即居中并置前，避免"点了没反应"
+            NSApp.activate(ignoringOtherApps: true)
+            if let w = NSApp.windows.first {
+                w.center()
+                w.makeKeyAndOrderFront(nil)
+            }
+        }
         .sheet(isPresented: $engine.showDonate) { DonateSheet(show: $engine.showDonate) }
     }
 
@@ -409,6 +343,7 @@ struct ContentView: View {
         .cornerRadius(8)
     }
 
+    // 一键启动游戏（次按钮，浅灰底）
     private var launchRow: some View {
         Button(action: { engine.launchGame() }) {
             Text("🎮 启动游戏")
@@ -506,6 +441,17 @@ struct ContentView: View {
     }
 }
 
+@main
+struct XiaobaiHelperApp: App {
+    var body: some Scene {
+        WindowGroup("xiaobai助手") {
+            ContentView().environmentObject(Engine())
+        }
+        .windowResizability(.contentSize)
+        .defaultPosition(.center)
+    }
+}
+
 // MARK: - 打赏弹窗
 
 struct DonateSheet: View {
@@ -537,16 +483,5 @@ struct DonateSheet: View {
         .frame(width: 300, height: 430)
         .background(bg)
         .preferredColorScheme(.light)
-    }
-}
-
-@main
-struct XiaobaiHelperApp: App {
-    var body: some Scene {
-        WindowGroup("xiaobai助手") {
-            ContentView().environmentObject(Engine())
-        }
-        // 窗口大小锁定为内容尺寸（300×430），无法拖大拖小
-        .windowResizability(.contentSize)
     }
 }
