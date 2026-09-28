@@ -1,5 +1,5 @@
-// xiaobai助手 · Mac 极简版 v0.5.0
-// 匹配自动化：自动接受对局 / 自动开始匹配 / 自动重连 / 自动回到房间
+// xiaobai助手 · Mac 极简版 v0.6.0
+// 匹配自动化：自动接受对局 / 自动开始匹配 / 自动重连 / 自动回到房间 / 备战席抢英雄
 // 纯官方 LCU 本地 API —— 无注入 / 无内存读写 / 无键鼠模拟
 
 import SwiftUI
@@ -92,6 +92,16 @@ final class LCUClient {
     func post(_ p: String) async throws -> (Data, HTTPURLResponse) { try await req("POST", p) }
     func put(_ p: String) async throws -> (Data, HTTPURLResponse) { try await req("PUT", p) }
 
+    // 读取 LCU 内置资源（英雄头像等），带认证
+    func imageData(_ path: String) async -> NSImage? {
+        guard let url = URL(string: base + path) else { return nil }
+        var r = URLRequest(url: url)
+        r.setValue(auth, forHTTPHeaderField: "Authorization")
+        r.timeoutInterval = 3
+        if let (d, _) = try? await session.data(for: r) { return NSImage(data: d) }
+        return nil
+    }
+
     func phase() async throws -> String {
         let (d, h) = try await get("/lol-gameflow/v1/gameflow-phase")
         guard h.statusCode == 200 else { throw LCUError.badResponse }
@@ -129,6 +139,11 @@ struct LobbyInfo: Decodable {
     let canStartActivity: Bool?
     let localMember: LobbyMember?
 }
+struct ChampSelectSession: Decodable {
+    let benchEnabled: Bool?
+    let benchChampions: [BenchChampion]?
+}
+struct BenchChampion: Decodable { let championId: Int }
 
 @MainActor
 final class Engine: ObservableObject {
@@ -144,6 +159,9 @@ final class Engine: ObservableObject {
     @Published var showDonate = false
     @Published var gamePath = ""   // 空 = 自动识别
     @Published var attachToClient = true   // 吸附到客户端窗口右侧
+    @Published var benchChamps: [Int] = []          // 备战席英雄（选人阶段）
+    @Published var champIcons: [Int: NSImage] = [:] // 英雄头像缓存
+    @Published var pickTargetId: Int = 0            // 抢购目标（0 = 未设置）
 
     private var pollTask: Task<Void, Never>?
     private var acceptTask: Task<Void, Never>?
@@ -332,6 +350,12 @@ final class Engine: ObservableObject {
                         }
                     }
                     if p == "Lobby" && autoStart { await tryAutoStart(client: c) }
+                    // 备战席抢英雄：选人阶段盯守
+                    if p == "ChampSelect" {
+                        await refreshChampSelect(client: c)
+                    } else if !benchChamps.isEmpty {
+                        benchChamps = []             // 离开选人，清空头像墙
+                    }
                 } catch {
                     if connected { connected = false; log("连接出错，重新发现客户端…") }
                     client = nil; prevPhase = ""; phaseRaw = ""
@@ -343,6 +367,42 @@ final class Engine: ObservableObject {
 
     private func isEndOfGamePhase(_ p: String) -> Bool {
         p == "PreEndOfGame" || p == "WaitingForStats" || p == "EndOfGame"
+    }
+
+    // MARK: 备战席抢英雄
+    func setPickTarget(_ id: Int) {
+        if id == 0 || id == pickTargetId {
+            pickTargetId = 0
+            log("已清除抢购目标")
+        } else {
+            pickTargetId = id
+            log("🎯 已设抢购目标（id \(id)），它一出现在备战席就自动换上")
+        }
+    }
+
+    private func refreshChampSelect(client c: LCUClient) async {
+        guard let (d, h) = try? await c.get("/lol-champ-select/v1/session"), h.statusCode == 200 else {
+            if !benchChamps.isEmpty { benchChamps = [] }   // 选人还没开始 / 已结束
+            return
+        }
+        guard let s = try? JSONDecoder().decode(ChampSelectSession.self, from: d) else { return }
+        let ids = (s.benchChampions ?? []).map { $0.championId }
+        benchChamps = ids
+        for id in ids where champIcons[id] == nil {
+            if let img = await c.imageData("/lol-game-data/assets/v1/champion-icons/\(id).png") {
+                champIcons[id] = img
+            }
+        }
+        // 目标英雄出现在备战席 → 立刻自动换上
+        if pickTargetId != 0, ids.contains(pickTargetId) {
+            if let (_, h2) = try? await c.post("/lol-champ-select/v1/session/bench/swap/\(pickTargetId)"),
+               (200..<300).contains(h2.statusCode) {
+                log("✅ 备战席已自动换上目标英雄（id \(pickTargetId)）")
+                pickTargetId = 0
+            } else {
+                logOnce("swap-fail", "⚠ 自动换英雄未成功，下一拍重试")
+            }
+        }
     }
 
     private func doAccept(client c: LCUClient) async {
@@ -482,10 +542,11 @@ struct ContentView: View {
             mainButton
             launchRow
             settingsCard
+            benchWall
             logCard
         }
         .padding(12)
-        .frame(width: 300, height: 430)
+        .frame(width: 300, height: 580)
         .background(bg)
         .preferredColorScheme(.light)
         .onAppear {
@@ -594,6 +655,63 @@ struct ContentView: View {
         .padding(10)
         .background(cardColor)
         .cornerRadius(8)
+    }
+
+    // 备战席头像墙：2 排 × 5 格，点头像设为抢购目标（蓝环）
+    private var benchWall: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Text("备战席抢英雄").font(.system(size: 10, weight: .semibold)).foregroundColor(sub)
+                Spacer()
+                if engine.pickTargetId != 0 {
+                    Button("清除目标") { engine.setPickTarget(0) }
+                        .font(.system(size: 9)).buttonStyle(.plain).foregroundColor(.red)
+                } else {
+                    Text("选人后点头像设为抢购目标").font(.system(size: 9)).foregroundColor(sub)
+                }
+            }
+            VStack(spacing: 6) {
+                ForEach(0..<2, id: \.self) { row in
+                    HStack(spacing: 6) {
+                        ForEach(0..<5, id: \.self) { col in
+                            benchCell(row * 5 + col)
+                        }
+                    }
+                }
+            }
+        }
+        .padding(10)
+        .background(cardColor)
+        .cornerRadius(8)
+    }
+
+    @ViewBuilder
+    private func benchCell(_ idx: Int) -> some View {
+        let id = idx < engine.benchChamps.count ? engine.benchChamps[idx] : 0
+        Button(action: { engine.setPickTarget(id) }) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(id != 0 ? Color(red: 0.93, green: 0.94, blue: 0.97)
+                                  : Color(red: 0.965, green: 0.965, blue: 0.975))
+                if id != 0 {
+                    if let img = engine.champIcons[id] {
+                        Image(nsImage: img).resizable().scaledToFit().padding(3)
+                    } else {
+                        Text("?").font(.system(size: 15, weight: .semibold)).foregroundColor(sub)
+                    }
+                    if engine.pickTargetId == id {
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color.accentColor, lineWidth: 3)
+                    }
+                } else {
+                    Image(systemName: "person.crop.circle")
+                        .font(.system(size: 14)).foregroundColor(Color(red: 0.85, green: 0.86, blue: 0.88))
+                }
+            }
+            .frame(width: 49, height: 49)
+        }
+        .buttonStyle(.plain)
+        .disabled(id == 0)
     }
 
     private var logCard: some View {
