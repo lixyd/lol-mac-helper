@@ -131,9 +131,11 @@ final class Engine: ObservableObject {
     private var lastStartOkLog: Date = .distantPast
     private var activityToken: NSObjectProtocol?   // 阻止 App Nap 节流
 
-    // 搜索状态机：进房间只尝试一次，失败长冷却，防止高频请求触发 Cloudflare 限流
+    // 搜索状态机：每次进房间只尝试一次，失败熔断，绝不高频重试
     private var searchAttempted = false
     private var searchCooldownUntil: Date = .distantPast
+    private var searchFailCount = 0
+    private var searchDisabled = false   // 熔断：连续失败后本会话不再自动排队
 
     // 游戏路径设置持久化（~/Library/Application Support/xiaobai助手/settings.json）
     private let settingsURL: URL = {
@@ -188,6 +190,8 @@ final class Engine: ObservableObject {
         phaseRaw = ""; prevPhase = ""
         everLoggedWaiting = false
         searchAttempted = false
+        searchFailCount = 0
+        searchDisabled = false
         log("■ 自动化已停止")
     }
 
@@ -281,7 +285,7 @@ final class Engine: ObservableObject {
     }
 
     private func tryAutoStart(client c: LCUClient) async {
-        guard Date() >= searchCooldownUntil else { return }
+        guard !searchDisabled, Date() >= searchCooldownUntil else { return }
         guard let (d, h) = try? await c.get("/lol-lobby/v2/lobby/matchmaking/search-state"),
               h.statusCode == 200,
               let st = try? JSONDecoder().decode(SearchState.self, from: d) else { return }
@@ -295,8 +299,7 @@ final class Engine: ObservableObject {
                 searchCooldownUntil = Date().addingTimeInterval(30)
                 return
             }
-            // 组队时队友未点准备会导致排队失败，先把自己置为准备
-            _ = try? await c.put("/lol-lobby/v1/parties/ready", body: "true")
+            // 只发一次请求，不做任何额外的状态改写
             var ok = false
             var code = 0
             if let (_, h2) = try? await c.post("/lol-lobby/v2/lobby/matchmaking/search") {
@@ -304,24 +307,20 @@ final class Engine: ObservableObject {
                 ok = (200..<300).contains(code)
             }
             if ok {
+                searchFailCount = 0
                 if Date().timeIntervalSince(lastStartOkLog) > 15 {
                     log("已自动开始匹配")
                     lastStartOkLog = Date()
                 }
             } else {
-                searchCooldownUntil = Date().addingTimeInterval(90)
-                if code == 403 {
-                    log("开始匹配被限流（HTTP 403），暂停 90 秒后再试")
+                searchFailCount += 1
+                if code == 403 || searchFailCount >= 2 {
+                    // 熔断：不再自动排队，避免影响客户端本身
+                    searchDisabled = true
+                    log("自动排队已停用（客户端拒绝 HTTP \(code)），仅保留自动接受")
                 } else {
-                    var reason = ""
-                    if let (d2, h3) = try? await c.get("/lol-lobby/v2/lobby"),
-                       h3.statusCode == 200,
-                       let obj = try? JSONSerialization.jsonObject(with: d2) as? [String: Any],
-                       let errs = obj["errors"] as? [[String: Any]],
-                       let msg = errs.first?["message"] as? String {
-                        reason = "：\(msg)"
-                    }
-                    log("开始匹配失败（HTTP \(code)）\(reason)，暂停 90 秒后再试")
+                    searchCooldownUntil = Date().addingTimeInterval(60)
+                    log("开始匹配失败（HTTP \(code)），60 秒后重试一次")
                 }
             }
         default:
