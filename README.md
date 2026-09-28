@@ -2,7 +2,7 @@
 
 **英雄联盟（League of Legends / LOL）** macOS 原生助手插件：极地大乱斗 / 海克斯大乱斗 **自动接受对局、自动开始匹配、自动重连、一键启动游戏、窗口吸附客户端**。
 
-Windows 版（[lixyd/xiaobai-helper](https://github.com/lixyd/xiaobai-helper)）的 macOS 移植 —— **Swift + SwiftUI，无 Python 依赖，双击即用**。
+Windows 版（[lixyd/lol-helper](https://github.com/lixyd/lol-helper)）的 macOS 移植 —— **Swift + SwiftUI，无 Python 依赖，双击即用**。
 
 纯官方 LCU 本地 API —— **无进程注入 / 无内存读写 / 无键鼠模拟**，**不需要辅助功能等任何系统权限**。
 
@@ -38,8 +38,8 @@ Windows 版（[lixyd/xiaobai-helper](https://github.com/lixyd/xiaobai-helper)）
 ## 下载 / 构建
 
 ```zsh
-git clone https://github.com/lixyd/xiaobai-helper-mac.git
-cd xiaobai-helper-mac
+git clone https://github.com/lixyd/lol-mac-helper.git
+cd lol-mac-helper
 ./build.sh          # 产出 build/xiaobai助手.app（arm64，ad-hoc 签名）
 ```
 
