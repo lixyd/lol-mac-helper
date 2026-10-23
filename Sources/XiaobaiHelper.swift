@@ -413,8 +413,9 @@ final class Engine: ObservableObject {
                         }
                     }
                     if p == "Lobby" && autoStart { await tryAutoStart(client: c) }
-                    // 自动领取奖励：30s 节流，三个来源（奖励 / 任务 / 事件中心）各查一轮
-                    if autoClaim && Date().timeIntervalSince(lastClaim) >= 30 {
+                    // 自动领取奖励：30 分钟节流（1800s），三个来源（奖励 / 任务 / 事件中心）各查一轮
+                    // 首次连接即跑一轮（lastClaim 初始为 distantPast），之后每 30 分钟一次
+                    if autoClaim && Date().timeIntervalSince(lastClaim) >= 1800 {
                         lastClaim = Date()
                         await claimPass(client: c)
                     }
