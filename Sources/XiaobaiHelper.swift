@@ -1,5 +1,6 @@
-// xiaobai助手 · Mac 极简版 v0.6.0
+// xiaobai助手 · Mac 极简版 v0.7.0
 // 匹配自动化：自动接受对局 / 自动开始匹配 / 自动重连 / 自动回到房间 / 备战席抢英雄
+// 自动领取：奖励（lol-rewards）/ 任务（lol-missions）/ 事件中心（lol-event-hub）
 // 纯官方 LCU 本地 API —— 无注入 / 无内存读写 / 无键鼠模拟
 
 import SwiftUI
@@ -79,10 +80,14 @@ final class LCUClient {
         session = URLSession(configuration: cfg, delegate: InsecureTrustDelegate(), delegateQueue: nil)
     }
 
-    private func req(_ m: String, _ p: String) async throws -> (Data, HTTPURLResponse) {
+    private func req(_ m: String, _ p: String, _ body: Data? = nil) async throws -> (Data, HTTPURLResponse) {
         var r = URLRequest(url: URL(string: base + p)!)
         r.httpMethod = m
         r.setValue(auth, forHTTPHeaderField: "Authorization")
+        if let body {
+            r.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            r.httpBody = body
+        }
         let (d, resp) = try await session.data(for: r)
         guard let h = resp as? HTTPURLResponse else { throw LCUError.badResponse }
         return (d, h)
@@ -91,6 +96,8 @@ final class LCUClient {
     func get(_ p: String) async throws -> (Data, HTTPURLResponse) { try await req("GET", p) }
     func post(_ p: String) async throws -> (Data, HTTPURLResponse) { try await req("POST", p) }
     func put(_ p: String) async throws -> (Data, HTTPURLResponse) { try await req("PUT", p) }
+    func postBody(_ p: String, _ body: Data) async throws -> (Data, HTTPURLResponse) { try await req("POST", p, body) }
+    func putBody(_ p: String, _ body: Data) async throws -> (Data, HTTPURLResponse) { try await req("PUT", p, body) }
 
     // 读取 LCU 内置资源（英雄头像等），带认证
     func imageData(_ path: String) async -> NSImage? {
@@ -145,6 +152,60 @@ struct ChampSelectSession: Decodable {
 }
 struct BenchChampion: Decodable { let championId: Int }
 
+// MARK: - 自动领取数据结构（对齐 LeagueAkari 的 claim-tools）
+
+// lol-rewards：宝箱 / 胶囊 / 图标等（status=PENDING_SELECTION 为待领取）
+struct RewardGrant: Decodable {
+    struct Info: Decodable { let id: String }
+    struct RewardGroup: Decodable {
+        let id: String
+        let rewards: [GrantReward]?
+        let selectionStrategyConfig: SelectionConfig?
+        let localizations: [String: String]?
+    }
+    struct GrantReward: Decodable { let id: String; let localizations: [String: String]? }
+    struct SelectionConfig: Decodable {
+        let maxSelectionsAllowed: Int?
+        let minSelectionsAllowed: Int?
+    }
+    let info: Info
+    let rewardGroup: RewardGroup
+}
+
+// lol-missions：任务奖励（status=SELECT_REWARDS 为待选择领取）
+struct MissionEntry: Decodable {
+    struct Reward: Decodable { let rewardGroup: String; let description: String? }
+    struct Strategy: Decodable {
+        let selectMaxGroupCount: Int?
+        let selectMinGroupCount: Int?
+    }
+    let id: String
+    let status: String?
+    let title: String?
+    let rewards: [Reward]?
+    let rewardStrategy: Strategy?
+}
+
+// lol-event-hub：事件中心奖励轨（unclaimedRewardCount > 0 为有待领）
+struct EventHubEntry: Decodable {
+    struct Info: Decodable {
+        let eventId: String?
+        let eventName: String?
+        let unclaimedRewardCount: Int?
+    }
+    let eventId: String
+    let eventInfo: Info
+}
+
+// localizations 字段在不同客户端版本可能是 {"title": "..."} 或按语言分键，
+// 统一按字典解析，取 title / zh_CN / 任意非空值，取不到返回 nil
+func locName(_ dict: [String: String]?) -> String? {
+    guard let dict, !dict.isEmpty else { return nil }
+    if let t = dict["title"], !t.isEmpty { return t }
+    if let t = dict["zh_CN"], !t.isEmpty { return t }
+    return dict.values.first { !$0.isEmpty }
+}
+
 @MainActor
 final class Engine: ObservableObject {
     @Published var running = false
@@ -155,6 +216,7 @@ final class Engine: ObservableObject {
     @Published var autoStart = true
     @Published var autoReconnect = true
     @Published var autoPlayAgain = false
+    @Published var autoClaim = true           // 自动领取奖励（奖励 / 任务 / 事件中心）
     @Published var acceptDelay: Double = 1
     @Published var showDonate = false
     @Published var gamePath = ""   // 空 = 自动识别
@@ -174,6 +236,7 @@ final class Engine: ObservableObject {
     private var cancelLogged = false
     private var lastReconnect: Date = .distantPast
     private var lastPlayAgain: Date = .distantPast
+    private var lastClaim: Date = .distantPast
     private var warned: Set<String> = []
     private var everLoggedWaiting = false
     private var handledReadyCheck = false
@@ -350,6 +413,11 @@ final class Engine: ObservableObject {
                         }
                     }
                     if p == "Lobby" && autoStart { await tryAutoStart(client: c) }
+                    // 自动领取奖励：30s 节流，三个来源（奖励 / 任务 / 事件中心）各查一轮
+                    if autoClaim && Date().timeIntervalSince(lastClaim) >= 30 {
+                        lastClaim = Date()
+                        await claimPass(client: c)
+                    }
                     // 备战席抢英雄：选人阶段盯守
                     if p == "ChampSelect" {
                         await refreshChampSelect(client: c)
@@ -431,6 +499,99 @@ final class Engine: ObservableObject {
                 }
             }
             try? await Task.sleep(nanoseconds: 500_000_000)
+        }
+    }
+
+    // MARK: 自动领取奖励（实现依据 LeagueAkari claim-tools：全部走 LCU 本地 API）
+    //
+    // ① lol-rewards：GET /grants?status=PENDING_SELECTION
+    //    → POST /grants/{id}/select  {grantId, rewardGroupId, selections:[奖励id]}
+    //    多选一按 selectionStrategyConfig.maxSelectionsAllowed 取前 N 个
+    // ② lol-missions：GET /missions 筛 status=SELECT_REWARDS
+    //    → PUT /player/{id}  {rewardGroups:[奖励组id]}
+    // ③ lol-event-hub：GET /events 筛 eventInfo.unclaimedRewardCount>0
+    //    → POST /events/{id}/reward-track/claim-all 一键全领
+
+    // 返回本轮领取成功的条数
+    @discardableResult
+    private func claimPass(client c: LCUClient) async -> Int {
+        var claimed = 0
+
+        // ① 奖励（宝箱 / 胶囊 / 图标等）
+        if let (d, h) = try? await c.get("/lol-rewards/v1/grants?status=PENDING_SELECTION"),
+           h.statusCode == 200,
+           let grants = try? JSONDecoder().decode([RewardGrant].self, from: d) {
+            for g in grants {
+                guard let rewards = g.rewardGroup.rewards, !rewards.isEmpty else { continue }
+                let maxSel = g.rewardGroup.selectionStrategyConfig?.maxSelectionsAllowed ?? 1
+                let n = max(1, min(maxSel, rewards.count))
+                let ids = rewards.prefix(n).map { $0.id }
+                let body: [String: Any] = [
+                    "grantId": g.info.id,
+                    "rewardGroupId": g.rewardGroup.id,
+                    "selections": ids
+                ]
+                guard let bd = try? JSONSerialization.data(withJSONObject: body),
+                      let (_, h2) = try? await c.postBody("/lol-rewards/v1/grants/\(g.info.id)/select", bd),
+                      (200..<300).contains(h2.statusCode) else {
+                    logOnce("claim-reward-fail", "⚠ 有奖励领取失败（可能需要手动选择），稍后自动重试")
+                    continue
+                }
+                claimed += 1
+                log("🎁 已领取：\(locName(g.rewardGroup.localizations) ?? "奖励")")
+            }
+        }
+
+        // ② 任务奖励
+        if let (d, h) = try? await c.get("/lol-missions/v1/missions"),
+           h.statusCode == 200,
+           let missions = try? JSONDecoder().decode([MissionEntry].self, from: d) {
+            for m in missions where m.status == "SELECT_REWARDS" {
+                guard let rewards = m.rewards, !rewards.isEmpty else { continue }
+                let n = max(1, min(m.rewardStrategy?.selectMaxGroupCount ?? 1, rewards.count))
+                let groups = rewards.prefix(n).map { $0.rewardGroup }
+                let body: [String: Any] = ["rewardGroups": groups]
+                guard let bd = try? JSONSerialization.data(withJSONObject: body),
+                      let (_, h2) = try? await c.putBody("/lol-missions/v1/player/\(m.id)", bd),
+                      (200..<300).contains(h2.statusCode) else {
+                    logOnce("claim-mission-fail", "⚠ 有任务奖励领取失败，稍后自动重试")
+                    continue
+                }
+                claimed += 1
+                log("🎁 已领取任务奖励：\(m.title ?? m.rewards?.first?.description ?? "任务")")
+            }
+        }
+
+        // ③ 事件中心（通行证 / 活动奖励轨）
+        if let (d, h) = try? await c.get("/lol-event-hub/v1/events"),
+           h.statusCode == 200,
+           let events = try? JSONDecoder().decode([EventHubEntry].self, from: d) {
+            for e in events where (e.eventInfo.unclaimedRewardCount ?? 0) > 0 {
+                guard let (_, h2) = try? await c.post("/lol-event-hub/v1/events/\(e.eventId)/reward-track/claim-all"),
+                      (200..<300).contains(h2.statusCode) else {
+                    logOnce("claim-event-fail", "⚠ 事件中心奖励领取失败，稍后自动重试")
+                    continue
+                }
+                claimed += 1
+                log("🎁 已领取事件奖励：\(e.eventInfo.eventName ?? e.eventId)")
+            }
+        }
+
+        return claimed
+    }
+
+    // 手动「立即领取」：不依赖自动化开关，自己发现客户端跑一轮
+    func claimNow() {
+        Task { [weak self] in
+            guard let self else { return }
+            var c = self.client
+            if c == nil, let lf = discoverLockfile() {
+                c = LCUClient(port: lf.port, password: lf.password)
+            }
+            guard let c else { self.log("未找到游戏客户端，无法领取"); return }
+            self.log("正在检查可领取奖励…")
+            let n = await self.claimPass(client: c)
+            self.log(n > 0 ? "领取完成（本轮 \(n) 项）" : "暂无可领取的奖励")
         }
     }
 
@@ -541,12 +702,13 @@ struct ContentView: View {
             header
             mainButton
             launchRow
+            claimRow
             settingsCard
             benchWall
             logCard
         }
         .padding(12)
-        .frame(width: 300, height: 580)
+        .frame(width: 300, height: 640)
         .background(bg)
         .preferredColorScheme(.light)
         .onAppear {
@@ -604,6 +766,19 @@ struct ContentView: View {
         .cornerRadius(8)
     }
 
+    // 立即领取奖励（手动触发一轮：奖励 / 任务 / 事件中心）
+    private var claimRow: some View {
+        Button(action: { engine.claimNow() }) {
+            Text("🎁 领取奖励")
+                .font(.system(size: 12, weight: .medium))
+                .frame(maxWidth: .infinity, minHeight: 26)
+        }
+        .buttonStyle(.plain)
+        .background(Color(red: 0.88, green: 0.89, blue: 0.91))
+        .foregroundColor(ink)
+        .cornerRadius(8)
+    }
+
     // 手动指定游戏客户端路径（选 .app 包）
     private func pickGamePath() {
         let panel = NSOpenPanel()
@@ -634,6 +809,7 @@ struct ContentView: View {
             Toggle("自动开始匹配", isOn: $engine.autoStart).foregroundColor(ink)
             Toggle("自动重连", isOn: $engine.autoReconnect).foregroundColor(ink)
             Toggle("自动回到房间", isOn: $engine.autoPlayAgain).foregroundColor(ink)
+            Toggle("自动领取奖励", isOn: $engine.autoClaim).foregroundColor(ink)
             Toggle("吸附客户端右侧", isOn: Binding(
                 get: { engine.attachToClient },
                 set: { engine.setAttach($0) }

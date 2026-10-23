@@ -1,6 +1,6 @@
 # xiaobai助手 · Mac 版 —— 英雄联盟 LOL 极地大乱斗助手工具
 
-**英雄联盟（League of Legends / LOL）** macOS 原生助手插件：极地大乱斗 / 海克斯大乱斗 **自动接受对局、自动开始匹配、自动重连、一键启动游戏、窗口吸附客户端**。
+**英雄联盟（League of Legends / LOL）** macOS 原生助手插件：极地大乱斗 / 海克斯大乱斗 **自动接受对局、自动开始匹配、自动重连、自动领取奖励、一键启动游戏、窗口吸附客户端**。
 
 Windows 版（[lixyd/lol-helper](https://github.com/lixyd/lol-helper)）的 macOS 移植 —— **Swift + SwiftUI，无 Python 依赖，双击即用**。
 
@@ -19,6 +19,16 @@ Windows 版（[lixyd/lol-helper](https://github.com/lixyd/lol-helper)）的 macO
 - **自动重连**：掉线（Reconnect 阶段）自动连回对局
 - **自动回到房间**：结算后自动点「再次游戏」（默认关闭）
 
+### 自动领取奖励（v0.7.0 新增）
+- **`🎁 领取奖励`**：立即手动领取一轮；也可开「自动领取奖励」，自动化运行中每 30s 自动检查一轮
+- 覆盖三个来源，全部走 LCU 本地 API（实现对齐 LeagueAkari claim-tools）：
+  - **奖励**（海克斯宝箱 / 胶囊 / 神秘图标等）：`GET /lol-rewards/v1/grants?status=PENDING_SELECTION`
+    → `POST /lol-rewards/v1/grants/{id}/select`；多选一按 `maxSelectionsAllowed` 自动勾选
+  - **任务奖励**：`GET /lol-missions/v1/missions` 筛 `SELECT_REWARDS` → `PUT /lol-missions/v1/player/{id}`
+  - **事件中心 / 通行证奖励轨**：`GET /lol-event-hub/v1/events` 筛 `unclaimedRewardCount > 0`
+    → `POST /lol-event-hub/v1/events/{id}/reward-track/claim-all` 一键全领
+- 每领一项都有日志；领取失败自动稍后重试，不刷屏
+
 ### 一键启动游戏
 - **`🎮 启动游戏`**：优先使用手动指定的路径，否则自动识别
   （`/Applications/League of Legends.app` → `~/Applications` → Riot Client.app）
@@ -31,7 +41,7 @@ Windows 版（[lixyd/lol-helper](https://github.com/lixyd/lol-helper)）的 macO
 - 纯读取窗口位置信息实现，**不需要任何系统权限**
 
 ### 其他
-- Apple 风格浅色 UI（`#F5F5F7` + 白卡片 + `#0071E3`），锁定窗口 300×430，不遮挡游戏
+- Apple 风格浅色 UI（`#F5F5F7` + 白卡片 + `#0071E3`），锁定窗口 300×640，不遮挡游戏
 - **打赏 ❤**：内置微信打赏码
 - 窗口图标 = Windows 版同款 logo
 
@@ -59,7 +69,8 @@ cd lol-mac-helper
 - [x] 匹配自动化（接受 / 开始 / 重连 / 回到房间）
 - [x] 一键启动游戏（自动识别 + 手动指定）
 - [x] 窗口吸附客户端右侧
-- [ ] 备战席抢英雄
+- [x] 备战席抢英雄
+- [x] 自动领取奖励（奖励 / 任务 / 事件中心）
 - [ ] 海克斯图鉴
 - [ ] 菜单栏常驻模式
 
