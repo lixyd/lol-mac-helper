@@ -1,6 +1,6 @@
 # xiaobai助手 · Mac 版 —— 英雄联盟 LOL 极地大乱斗助手工具
 
-**英雄联盟（League of Legends / LOL）** macOS 原生助手插件：极地大乱斗 / 海克斯大乱斗 **自动接受对局、自动开始匹配、自动重连、自动领取奖励、一键启动游戏、窗口吸附客户端**。
+**英雄联盟（League of Legends / LOL）** macOS 原生助手插件：极地大乱斗 / 海克斯大乱斗 **自动接受对局、自动开始匹配、自动重连、自动领取奖励、游戏开始自动隐藏 / 结束自动弹出、一键启动游戏、窗口吸附客户端**。
 
 Windows 版（[lixyd/lol-helper](https://github.com/lixyd/lol-helper)）的 macOS 移植 —— **Swift + SwiftUI，无 Python 依赖，双击即用**。
 
@@ -29,6 +29,13 @@ Windows 版（[lixyd/lol-helper](https://github.com/lixyd/lol-helper)）的 macO
     → `POST /lol-event-hub/v1/events/{id}/reward-track/claim-all` 一键全领
 - 每领一项都有日志；领取失败自动稍后重试，不刷屏
 
+### 游戏开始隐藏 / 结束弹出（v0.8.0 新增，默认开启）
+- **对局开始自动隐藏**：进入游戏（GameStart / InProgress 阶段）时，助手窗口自动隐藏，不干扰对局
+- **对局结束自动弹出**：离开对局阶段（结算 / 回到房间等）时，助手窗口自动恢复并置前
+- 可在设置里随时关闭；关闭开关会立即恢复窗口
+- 断开连接或停止自动化时也会恢复窗口，不会"消失"
+- 纯本地窗口显隐，**不需要任何系统权限**
+
 ### 一键启动游戏
 - **`🎮 启动游戏`**：优先使用手动指定的路径，否则自动识别
   （`/Applications/League of Legends.app` → `~/Applications` → Riot Client.app）
@@ -41,7 +48,7 @@ Windows 版（[lixyd/lol-helper](https://github.com/lixyd/lol-helper)）的 macO
 - 纯读取窗口位置信息实现，**不需要任何系统权限**
 
 ### 其他
-- Apple 风格浅色 UI（`#F5F5F7` + 白卡片 + `#0071E3`），锁定窗口 300×640，不遮挡游戏
+- Apple 风格浅色 UI（`#F5F5F7` + 白卡片 + `#0071E3`），锁定窗口 300×660，不遮挡游戏
 - **打赏 ❤**：内置微信打赏码
 - 窗口图标 = Windows 版同款 logo
 
@@ -71,6 +78,7 @@ cd lol-mac-helper
 - [x] 窗口吸附客户端右侧
 - [x] 备战席抢英雄
 - [x] 自动领取奖励（奖励 / 任务 / 事件中心）
+- [x] 游戏开始自动隐藏，结束自动弹出（默认开启）
 - [ ] 海克斯图鉴
 - [ ] 菜单栏常驻模式
 

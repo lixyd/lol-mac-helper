@@ -1,6 +1,7 @@
-// xiaobai助手 · Mac 极简版 v0.7.0
+// xiaobai助手 · Mac 极简版 v0.8.0
 // 匹配自动化：自动接受对局 / 自动开始匹配 / 自动重连 / 自动回到房间 / 备战席抢英雄
 // 自动领取：奖励（lol-rewards）/ 任务（lol-missions）/ 事件中心（lol-event-hub）
+// 游戏开始自动隐藏窗口，结束自动弹出（默认开启）
 // 纯官方 LCU 本地 API —— 无注入 / 无内存读写 / 无键鼠模拟
 
 import SwiftUI
@@ -217,6 +218,7 @@ final class Engine: ObservableObject {
     @Published var autoReconnect = true
     @Published var autoPlayAgain = false
     @Published var autoClaim = true           // 自动领取奖励（奖励 / 任务 / 事件中心）
+    @Published var autoHideOnGame = true      // 游戏开始自动隐藏窗口，结束自动弹出（默认开启）
     @Published var acceptDelay: Double = 1
     @Published var showDonate = false
     @Published var gamePath = ""   // 空 = 自动识别
@@ -240,6 +242,7 @@ final class Engine: ObservableObject {
     private var warned: Set<String> = []
     private var everLoggedWaiting = false
     private var handledReadyCheck = false
+    private var hiddenForGame = false         // 当前是否因对局中而隐藏了窗口
 
     private func logOnce(_ key: String, _ msg: String) {
         guard !warned.contains(key) else { return }
@@ -265,11 +268,13 @@ final class Engine: ObservableObject {
            let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
             gamePath = obj["game_path"] as? String ?? ""
             if let a = obj["attach_to_client"] as? Bool { attachToClient = a }
+            if let h = obj["auto_hide_on_game"] as? Bool { autoHideOnGame = h }
         }
     }
 
     private func saveSettings() {
-        let obj: [String: Any] = ["game_path": gamePath, "attach_to_client": attachToClient]
+        let obj: [String: Any] = ["game_path": gamePath, "attach_to_client": attachToClient,
+                                  "auto_hide_on_game": autoHideOnGame]
         if let d = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted]) {
             try? d.write(to: settingsURL)
         }
@@ -285,6 +290,43 @@ final class Engine: ObservableObject {
         attachToClient = on
         saveSettings()
         log(on ? "已开启：吸附客户端窗口右侧" : "已关闭吸附")
+    }
+
+    func setAutoHide(_ on: Bool) {
+        autoHideOnGame = on
+        saveSettings()
+        if !on { restoreWindowIfHidden() }        // 关闭开关时立刻恢复窗口
+        log(on ? "已开启：游戏开始自动隐藏，结束自动弹出" : "已关闭：游戏隐藏")
+    }
+
+    // MARK: 游戏开始隐藏 / 结束弹出
+    private func helperWindow() -> NSWindow? {
+        NSApp.mainWindow ?? NSApp.windows.first(where: { $0.level == .normal })
+    }
+
+    private func hideHelperWindow() {
+        guard let w = helperWindow(), w.isVisible else { return }
+        w.orderOut(nil)
+        hiddenForGame = true
+        log("🎮 对局开始，助手已隐藏（结束后自动弹出）")
+    }
+
+    private func showHelperWindow() {
+        guard let w = helperWindow() else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        w.makeKeyAndOrderFront(nil)
+        hiddenForGame = false
+        log("🏁 对局结束，助手已弹出")
+    }
+
+    // 断开连接 / 停止自动化 / 关闭开关时：若窗口因游戏被隐藏，恢复出来
+    private func restoreWindowIfHidden() {
+        guard hiddenForGame else { return }
+        hiddenForGame = false
+        if let w = helperWindow() {
+            NSApp.activate(ignoringOtherApps: true)
+            w.makeKeyAndOrderFront(nil)
+        }
     }
 
     // 跟随客户端窗口：贴右侧，右边放不下则贴左侧，顶部对齐
@@ -340,6 +382,7 @@ final class Engine: ObservableObject {
         warned.removeAll()
         searchThrottle = 5
         lastReconnect = .distantPast; lastPlayAgain = .distantPast
+        restoreWindowIfHidden()                  // 停止时恢复被游戏隐藏的窗口
         log("■ 自动化已停止")
     }
 
@@ -371,6 +414,13 @@ final class Engine: ObservableObject {
                     if phaseChanged {
                         log("阶段 → \(phaseDisplay(p))")
                         if p != "ReadyCheck" { handledReadyCheck = false }
+                        // 游戏开始隐藏 / 结束弹出（默认开启）：
+                        // 进入 GameStart / InProgress → 隐藏助手窗口；离开对局阶段 → 弹出
+                        if autoHideOnGame {
+                            let inGame = (p == "GameStart" || p == "InProgress")
+                            if inGame, !hiddenForGame { hideHelperWindow() }
+                            else if !inGame, hiddenForGame { showHelperWindow() }
+                        }
                         // 进入新的结算阶段（WaitingForStats → PreEndOfGame → EndOfGame）时，
                         // 立即尝试一次回到房间（对齐 LeagueAkari 的分阶段处理）
                         if isEndOfGamePhase(p) { lastPlayAgain = .distantPast }
@@ -428,6 +478,7 @@ final class Engine: ObservableObject {
                 } catch {
                     if connected { connected = false; log("连接出错，重新发现客户端…") }
                     client = nil; prevPhase = ""; phaseRaw = ""
+                    restoreWindowIfHidden()      // 断开时恢复窗口，避免助手"消失"
                 }
             }
             try? await Task.sleep(nanoseconds: 500_000_000)
@@ -709,7 +760,7 @@ struct ContentView: View {
             logCard
         }
         .padding(12)
-        .frame(width: 300, height: 640)
+        .frame(width: 300, height: 660)
         .background(bg)
         .preferredColorScheme(.light)
         .onAppear {
@@ -811,6 +862,10 @@ struct ContentView: View {
             Toggle("自动重连", isOn: $engine.autoReconnect).foregroundColor(ink)
             Toggle("自动回到房间", isOn: $engine.autoPlayAgain).foregroundColor(ink)
             Toggle("自动领取奖励", isOn: $engine.autoClaim).foregroundColor(ink)
+            Toggle("游戏开始隐藏 / 结束弹出", isOn: Binding(
+                get: { engine.autoHideOnGame },
+                set: { engine.setAutoHide($0) }
+            )).foregroundColor(ink)
             Toggle("吸附客户端右侧", isOn: Binding(
                 get: { engine.attachToClient },
                 set: { engine.setAttach($0) }
